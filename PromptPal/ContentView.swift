@@ -33,10 +33,10 @@ struct ContentView: View {
             SidebarView(model: model, chooseFolder: chooseFolder)
                 .frame(minWidth: 260, idealWidth: 280, maxWidth: 340)
         } detail: {
-            MainView(model: model)
-                .frame(minWidth: 640)
+            MainPanelView(model: model)
         }
-        .frame(minWidth: 960, minHeight: 600)
+        .navigationSplitViewStyle(.balanced)
+        .frame(minWidth: 1000, minHeight: 600)
     }
 
     // MARK: - Folder Picker
@@ -103,18 +103,24 @@ struct SidebarView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
             } else {
-                List {
-                    OutlineGroup(model.nodes, children: \.children) { node in
-                        FileRowView(
-                            node: node,
-                            isHighlighted: model.highlightedNodeID == node.id,
-                            onToggle: { node, isOn in
-                                model.setSelection(for: node, isSelected: isOn)
-                            }
-                        )
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        OutlineGroup(model.nodes, children: \.children) { node in
+                            FileRowView(
+                                node: node,
+                                onToggle: { node, isOn in
+                                    model.setSelection(for: node, isSelected: isOn)
+                                }
+                            )
+                        }
+                        .padding(.leading, 4)
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .listStyle(.sidebar)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.gray.opacity(0.06))
+                )
             }
         }
         .padding()
@@ -125,7 +131,6 @@ struct SidebarView: View {
 
 struct FileRowView: View {
     @ObservedObject var node: FileNode
-    let isHighlighted: Bool
     let onToggle: (FileNode, Bool) -> Void
 
     var body: some View {
@@ -140,7 +145,7 @@ struct FileRowView: View {
             ) {
                 Label {
                     Text(node.name)
-                        .font(node.isDirectory ? .subheadline.weight(.semibold) : .body)
+                        .font(node.isDirectory ? .headline : .body)
                 } icon: {
                     Image(systemName: node.isDirectory ? "folder" : "doc.plaintext")
                 }
@@ -150,27 +155,14 @@ struct FileRowView: View {
             Spacer()
         }
         .padding(.vertical, 2)
-        .padding(.trailing, 4)
-        .contentShape(Rectangle())
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isHighlighted ? Color.accentColor.opacity(0.25) : .clear)
-        )
     }
 }
 
-// MARK: - Main Panel (Prompt + Instructions)
+// MARK: - Right Panel (Buttons + optional instructions + preview)
 
-struct MainView: View {
+struct MainPanelView: View {
     @ObservedObject var model: PromptPalModel
-
-    private enum MainTab {
-        case prompt
-        case instructions
-    }
-
-    @State private var tab: MainTab = .prompt
-    @State private var showTokenDetails = true
+    @State private var showInstructions = false
 
     private var hasAnythingToSend: Bool {
         !model.instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -178,52 +170,30 @@ struct MainView: View {
     }
 
     var body: some View {
-        VStack(spacing: 10) {
-            // Header
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Picker("", selection: $tab) {
-                    Text("Prompt Preview").tag(MainTab.prompt)
-                    Text("Instructions").tag(MainTab.instructions)
-                }
-                .pickerStyle(.segmented)
-                .frame(maxWidth: 320)
+        VStack(alignment: .leading, spacing: 12) {
 
-                Spacer()
-
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("Selected files: \(model.selectedFilesCount)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-
-                    let tokens = model.estimatedTokenCount
-                    Text("Estimated tokens: \(formatTokenCount(tokens))")
-                        .font(.caption)
-                        .foregroundStyle(tokens > 32_000 ? .red : .secondary)
-                }
-            }
-
-            // Main content
-            Group {
-                switch tab {
-                case .instructions:
-                    instructionsEditor
-                case .prompt:
-                    promptPreview(showTokenDetails: $showTokenDetails)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-            // Bottom controls
-            HStack {
-                Button("Generate Preview") {
+            // Top actions + file count
+            HStack(spacing: 8) {
+                Button {
                     model.rebuildPreview()
+                } label: {
+                    if model.isBuildingPrompt {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Building…")
+                        }
+                    } else {
+                        Text("Generate Preview")
+                    }
                 }
-                .disabled(!hasAnythingToSend)
+                .disabled(!hasAnythingToSend || model.isBuildingPrompt)
 
                 Button("Copy Prompt") {
                     model.copyPromptToPasteboard()
                 }
-                .disabled(!hasAnythingToSend)
+                // One click: this will build & copy, even if preview is empty
+                .disabled(!hasAnythingToSend || model.isBuildingPrompt)
 
                 Spacer()
 
@@ -231,41 +201,86 @@ struct MainView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            // Optional instructions, collapsed by default
+            DisclosureGroup(isExpanded: $showInstructions) {
+                TextEditor(text: $model.instructions)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minHeight: 80, maxHeight: 200)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.gray.opacity(0.25))
+                    )
+            } label: {
+                HStack {
+                    Text("Instructions (optional)")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                }
+            }
+
+            Text("Paste the generated prompt into your chat model (ChatGPT, Claude, etc.).")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Divider()
+
+            // Prompt preview area
+            PromptPreviewView(model: model)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .padding()
     }
+}
 
-    // MARK: - Instructions
+// MARK: - Prompt Preview Column
 
-    private var instructionsEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Optional instructions to the model")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+struct PromptPreviewView: View {
+    @ObservedObject var model: PromptPalModel
+    @State private var showTokenDetails = false
 
-            TextEditor(text: $model.instructions)
-                .font(.system(.body, design: .monospaced))
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color.gray.opacity(0.25))
-                )
-        }
-    }
-
-    // MARK: - Prompt + Tokens
-
-    private func promptPreview(showTokenDetails: Binding<Bool>) -> some View {
+    var body: some View {
         VStack(alignment: .leading, spacing: 10) {
+            // Header
+            HStack(alignment: .firstTextBaseline) {
+                Text("Prompt Preview")
+                    .font(.headline)
+
+                Spacer()
+
+                if model.isBuildingPrompt {
+                    HStack(spacing: 6) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Building…")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text("Selected files: \(model.selectedFilesCount)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        let tokens = model.estimatedTokenCount
+                        Text("Estimated tokens: \(formatTokenCount(tokens))")
+                            .font(.caption)
+                            .foregroundStyle(tokens > 32_000 ? .red : .secondary)
+                    }
+                }
+            }
+
+            // Token summary / per-file tokens
             if model.selectedFilesCount > 0 {
-                tokenSummaryCard(showTokenDetails: showTokenDetails)
+                tokenSummaryCard
             }
 
             Divider()
 
+            // Scrollable prompt preview
             Group {
                 if model.promptPreview.isEmpty {
-                    Text("Use “Generate Preview” to see the prompt that will be copied.")
+                    Text("Click “Copy Prompt” or “Generate Preview” to build the prompt.")
                         .foregroundStyle(.secondary)
                         .padding(.top, 8)
                     Spacer()
@@ -287,10 +302,10 @@ struct MainView: View {
         }
     }
 
-    private func tokenSummaryCard(showTokenDetails: Binding<Bool>) -> some View {
+    private var tokenSummaryCard: some View {
         let fileTokenTotal = model.estimatedFileTokenTotal
 
-        return VStack(alignment: .leading, spacing: 8) {
+        return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Token summary")
                     .font(.subheadline.weight(.semibold))
@@ -303,57 +318,37 @@ struct MainView: View {
 
                 Button {
                     withAnimation(.easeInOut(duration: 0.2)) {
-                        showTokenDetails.wrappedValue.toggle()
+                        showTokenDetails.toggle()
                     }
                 } label: {
                     Image(systemName: "chevron.down")
-                        .rotationEffect(.degrees(showTokenDetails.wrappedValue ? 0 : -90))
+                        .rotationEffect(.degrees(showTokenDetails ? 0 : -90))
                         .font(.caption2.weight(.semibold))
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(showTokenDetails.wrappedValue ? "Hide per-file token estimates" : "Show per-file token estimates")
+                .accessibilityLabel(showTokenDetails ? "Hide per-file token estimates" : "Show per-file token estimates")
             }
 
-            if showTokenDetails.wrappedValue {
+            if showTokenDetails {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(model.fileTokenStatsSorted) { stat in
-                            Button {
-                                model.highlight(stat.node)
-                            } label: {
-                                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(stat.node.name)
-                                            .font(.caption.weight(.semibold))
+                        ForEach(model.fileTokenStats) { stat in
+                            HStack {
+                                Text(model.relativePath(for: stat.node))
+                                    .font(.caption)
+                                    .lineLimit(1)
 
-                                        Text(model.relativePath(for: stat.node))
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                            .lineLimit(1)
-                                    }
+                                Spacer()
 
-                                    Spacer()
-
-                                    Text("\(formatTokenCount(stat.tokenEstimate))")
-                                        .font(.caption.monospacedDigit())
-                                }
-                                .padding(.vertical, 4)
-                                .padding(.horizontal, 6)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 6)
-                                        .fill(
-                                            model.highlightedNodeID == stat.node.id
-                                            ? Color.accentColor.opacity(0.25)
-                                            : Color.clear
-                                        )
-                                )
+                                Text("\(formatTokenCount(stat.tokenEstimate))")
+                                    .font(.caption.monospacedDigit())
+                                    .foregroundStyle(.secondary)
                             }
-                            .buttonStyle(.plain)
                         }
                     }
                     .padding(.top, 2)
                 }
-                .frame(maxHeight: 180)
+                .frame(maxHeight: 140)
             }
         }
         .padding(10)
@@ -372,8 +367,8 @@ final class PromptPalModel: ObservableObject {
     @Published var instructions: String = ""
     @Published var promptPreview: String = ""
 
-    /// Which file is currently "focused" (e.g. from the token list)
-    @Published var highlightedNodeID: UUID?
+    // Used for disabling buttons / showing spinners
+    @Published var isBuildingPrompt: Bool = false
 
     // Dummy to force SwiftUI to refresh when selection changes
     @Published private var selectionVersion: Int = 0
@@ -385,7 +380,6 @@ final class PromptPalModel: ObservableObject {
         nodes = buildNodes(for: url)
         promptPreview = ""
         selectionVersion = 0
-        highlightedNodeID = nil
     }
 
     private func buildNodes(for directory: URL) -> [FileNode] {
@@ -446,47 +440,85 @@ final class PromptPalModel: ObservableObject {
         selectedFiles.count
     }
 
-    // MARK: Highlight helpers
-
-    func highlight(_ node: FileNode?) {
-        highlightedNodeID = node?.id
-    }
-
     // MARK: Prompt building
 
     func rebuildPreview() {
-        promptPreview = buildPrompt()
+        buildPrompt(applyToPasteboard: false)
     }
 
+    /// One-click: builds the prompt from the latest files and copies it.
     func copyPromptToPasteboard() {
-        let text = buildPrompt()
-        promptPreview = text
-
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        buildPrompt(applyToPasteboard: true)
     }
 
-    private func buildPrompt() -> String {
+    /// Shared builder used by both Generate Preview and Copy Prompt.
+    private func buildPrompt(applyToPasteboard: Bool) {
+        // Snapshot state on the main thread
+        let instructionsSnapshot = instructions
+        let trimmedInstructions = instructionsSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rootURLSnapshot = rootURL
+        let nodesSnapshot = nodes
+        let selectedFilesSnapshot = selectedFiles
+
+        // Nothing to send
+        guard !trimmedInstructions.isEmpty || !selectedFilesSnapshot.isEmpty else {
+            if !applyToPasteboard {
+                promptPreview = ""
+            }
+            return
+        }
+
+        isBuildingPrompt = true
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+
+            let prompt = self.buildPrompt(
+                instructions: instructionsSnapshot,
+                rootURL: rootURLSnapshot,
+                nodesSnapshot: nodesSnapshot,
+                selectedFilesSnapshot: selectedFilesSnapshot
+            )
+
+            DispatchQueue.main.async {
+                self.promptPreview = prompt
+
+                if applyToPasteboard {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(prompt, forType: .string)
+                }
+
+                self.isBuildingPrompt = false
+            }
+        }
+    }
+
+    private func buildPrompt(
+        instructions: String,
+        rootURL: URL?,
+        nodesSnapshot: [FileNode],
+        selectedFilesSnapshot: [FileNode]
+    ) -> String {
+        var sections: [String] = []
+
         let trimmedInstructions = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasFiles = !selectedFiles.isEmpty
+        let hasFiles = !selectedFilesSnapshot.isEmpty
 
         if trimmedInstructions.isEmpty && !hasFiles {
             return ""
         }
-
-        var sections: [String] = []
 
         if !trimmedInstructions.isEmpty {
             sections.append(trimmedInstructions)
         }
 
         if let rootURL {
-            sections.append(buildFileMapSection(rootURL: rootURL))
+            sections.append(buildFileMapSection(rootURL: rootURL, nodes: nodesSnapshot))
         }
 
         if hasFiles {
-            sections.append(buildFileContentsSection())
+            sections.append(buildFileContentsSection(files: selectedFilesSnapshot))
         }
 
         return sections.joined(separator: "\n\n")
@@ -494,7 +526,7 @@ final class PromptPalModel: ObservableObject {
 
     // MARK: - <file_map> section
 
-    private func buildFileMapSection(rootURL: URL) -> String {
+    private func buildFileMapSection(rootURL: URL, nodes: [FileNode]) -> String {
         var lines: [String] = []
         lines.append(rootURL.path)
 
@@ -554,8 +586,7 @@ final class PromptPalModel: ObservableObject {
 
     // MARK: - <file_contents> section
 
-    private func buildFileContentsSection() -> String {
-        let files = selectedFiles
+    private func buildFileContentsSection(files: [FileNode]) -> String {
         guard !files.isEmpty else {
             return "<file_contents>\n</file_contents>"
         }
@@ -603,11 +634,6 @@ final class PromptPalModel: ObservableObject {
             let tokens = max(1, content.count / 4)
             return FileTokenStat(node: node, tokenEstimate: tokens)
         }
-    }
-
-    /// Sorted by token estimate, largest first.
-    var fileTokenStatsSorted: [FileTokenStat] {
-        fileTokenStats.sorted { $0.tokenEstimate > $1.tokenEstimate }
     }
 
     var estimatedFileTokenTotal: Int {
@@ -660,6 +686,7 @@ final class FileNode: ObservableObject, Identifiable {
     @Published var isSelected: Bool
 
     private var cachedContent: String?
+    private var cachedModificationDate: Date?
 
     init(url: URL, isDirectory: Bool, children: [FileNode]? = nil, isSelected: Bool = false) {
         self.url = url
@@ -686,20 +713,35 @@ final class FileNode: ObservableObject, Identifiable {
         }
     }
 
+    /// Loads file content, re-reading from disk only when the file actually changed.
     func loadContent() -> String {
-        if let cachedContent {
+        let path = url.path
+        let fm = FileManager.default
+
+        var currentModDate: Date? = nil
+        if let attrs = try? fm.attributesOfItem(atPath: path),
+           let mod = attrs[.modificationDate] as? Date {
+            currentModDate = mod
+        }
+
+        if let cachedContent,
+           let cachedModificationDate,
+           let currentModDate,
+           cachedModificationDate == currentModDate {
             return cachedContent
         }
 
         let text: String
-        if let str = try? String(contentsOf: url, encoding: .utf8) {
+        if let str = try? String(contentsOfFile: path, encoding: .utf8) {
+            text = str
+        } else if let str = try? String(contentsOf: url, encoding: .utf8) {
             text = str
         } else {
-            // Treat anything we can't decode as a binary blob
             text = "[Binary file]"
         }
 
         cachedContent = text
+        cachedModificationDate = currentModDate
         return text
     }
 
