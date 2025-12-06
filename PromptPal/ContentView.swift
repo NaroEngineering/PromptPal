@@ -207,7 +207,7 @@ struct MainPanelView: View {
                 Button("Copy Prompt") {
                     model.copyPromptToPasteboard()
                 }
-                // Always rebuilds prompt and copies from latest file contents
+                // Rebuilds prompt from latest file contents AND updates preview + tokens.
                 .keyboardShortcut("c", modifiers: [.command, .option])
                 .disabled(!hasAnythingToSend || model.isBuildingPrompt)
 
@@ -235,9 +235,14 @@ struct MainPanelView: View {
                 }
             }
 
-            Text("Paste the generated prompt into your chat model (ChatGPT, Claude, etc.).")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+            Text("""
+Copy Prompt and Generate Preview both rebuild from the latest saved files and instructions.
+
+The preview below is truncated for speed, but it’s always based on the latest build, \
+and the token summary updates with your file edits.
+""")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
 
             Divider()
 
@@ -293,12 +298,17 @@ struct PromptPreviewView: View {
 
             Divider()
 
-            // Scrollable prompt preview
+            // Scrollable prompt preview (already truncated in model)
             Group {
                 if model.promptPreview.isEmpty {
-                    Text("Click “Generate Preview” to visualize the full prompt. “Copy Prompt” works even without a preview.")
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 8)
+                    Text("""
+No preview yet.
+
+Click “Generate Preview” or “Copy Prompt” to build a (truncated) view of the current prompt. \
+The full, untruncated prompt is always used when copying.
+""")
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 8)
                     Spacer()
                 } else {
                     ScrollView {
@@ -380,12 +390,8 @@ struct PromptPreviewView: View {
 final class PromptPalModel: ObservableObject {
     @Published var rootURL: URL?
     @Published var nodes: [FileNode] = []
-    @Published var instructions: String = "" {
-        didSet {
-            promptDirty = true
-        }
-    }
-    @Published var promptPreview: String = ""
+    @Published var instructions: String = ""
+    @Published var promptPreview: String = ""   // truncated preview for speed
 
     // Used for disabling buttons / showing spinners
     @Published var isBuildingPrompt: Bool = false
@@ -398,7 +404,6 @@ final class PromptPalModel: ObservableObject {
     @Published private(set) var estimatedFileTokenTotal: Int = 0
 
     // Internal flags
-    private var promptDirty: Bool = false
     private var tokenStatsGeneration: Int = 0
 
     // MARK: File tree loading
@@ -411,7 +416,6 @@ final class PromptPalModel: ObservableObject {
 
         promptPreview = ""
         selectionVersion = 0
-        promptDirty = true
         recalculateTokenStatsAsync()
     }
 
@@ -458,14 +462,12 @@ final class PromptPalModel: ObservableObject {
     func setAllSelected(_ value: Bool) {
         nodes.forEach { $0.setSelectedRecursively(value) }
         selectionVersion &+= 1
-        promptDirty = true
         recalculateTokenStatsAsync()
     }
 
     func setSelection(for node: FileNode, isSelected: Bool) {
         node.setSelectedRecursively(isSelected)
         selectionVersion &+= 1
-        promptDirty = true
         recalculateTokenStatsAsync()
     }
 
@@ -485,9 +487,16 @@ final class PromptPalModel: ObservableObject {
         let tokenEstimate: Int
     }
 
+    /// Recompute token stats from the current selected files.
     private func recalculateTokenStatsAsync() {
-        let selectedFilesSnapshot = selectedFiles
+        let snapshot = selectedFiles
+        recalculateTokenStatsAsync(selectedFilesSnapshot: snapshot)
+    }
 
+    /// Recompute token stats from a specific snapshot of selected files.
+    /// This is used when we build a prompt so that token stats are based
+    /// on the *same* files/contents that were used to build the prompt.
+    private func recalculateTokenStatsAsync(selectedFilesSnapshot: [FileNode]) {
         // If nothing is selected, clear quickly.
         if selectedFilesSnapshot.isEmpty {
             fileTokenStats = []
@@ -547,12 +556,19 @@ final class PromptPalModel: ObservableObject {
     // MARK: Prompt building
 
     func rebuildPreview() {
-        // Build and UPDATE preview, do NOT touch pasteboard
-        buildPrompt(applyToPasteboard: false, updatePreview: true, label: "GeneratePreview")
+        // Build and UPDATE preview, do NOT touch pasteboard,
+        // and recompute token stats from the same snapshot.
+        buildPrompt(
+            applyToPasteboard: false,
+            updatePreview: true,
+            label: "GeneratePreview",
+            recalcTokens: true
+        )
     }
 
     /// One-click: builds the prompt from the latest files and copies it.
-    /// This always rebuilds from disk to ensure freshest contents.
+    /// This always rebuilds from disk, updates the (truncated) preview,
+    /// and recomputes token stats from the same file snapshot.
     func copyPromptToPasteboard() {
         let hasAnythingToSend =
             !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
@@ -562,15 +578,20 @@ final class PromptPalModel: ObservableObject {
             return
         }
 
-        // Always build a fresh prompt for Copy Prompt.
-        buildPrompt(applyToPasteboard: true, updatePreview: false, label: "CopyPrompt build-only")
+        buildPrompt(
+            applyToPasteboard: true,
+            updatePreview: true,
+            label: "CopyPrompt",
+            recalcTokens: true
+        )
     }
 
     /// Shared builder used by both Generate Preview and Copy Prompt.
     private func buildPrompt(
         applyToPasteboard: Bool,
         updatePreview: Bool,
-        label: String
+        label: String,
+        recalcTokens: Bool
     ) {
         // Snapshot state on the main thread
         let instructionsSnapshot = instructions
@@ -604,12 +625,15 @@ final class PromptPalModel: ObservableObject {
 
             DispatchQueue.main.async {
                 if updatePreview {
-                    strongSelf.promptPreview = prompt
-                    strongSelf.promptDirty = false
+                    strongSelf.promptPreview = strongSelf.makeTruncatedPreview(from: prompt)
                 }
 
                 if applyToPasteboard {
                     copyToPasteboardTimed(prompt, label: label)
+                }
+
+                if recalcTokens {
+                    strongSelf.recalculateTokenStatsAsync(selectedFilesSnapshot: selectedFilesSnapshot)
                 }
 
                 strongSelf.isBuildingPrompt = false
@@ -732,7 +756,8 @@ final class PromptPalModel: ObservableObject {
             case "pbxproj": language = "pbxproj"
             case "xcworkspacedata": language = "xcworkspacedata"
             case "xcuserstate": language = "xcuserstate"
-            default: language = ""
+            default:
+                language = ""
             }
 
             let fenceStart = language.isEmpty ? "```" : "```\(language)"
@@ -752,12 +777,25 @@ final class PromptPalModel: ObservableObject {
         return "<file_contents>\n" + parts.joined(separator: "\n\n") + "\n</file_contents>"
     }
 
-    // MARK: - Overall token estimate (full prompt)
+    // MARK: - Preview + token helpers
 
+    /// Truncate the preview string to keep SwiftUI rendering fast.
+    private func makeTruncatedPreview(from full: String) -> String {
+        let maxChars = 4000  // tweak as needed
+        guard full.count > maxChars else {
+            return full
+        }
+
+        let idx = full.index(full.startIndex, offsetBy: maxChars)
+        let head = String(full[..<idx])
+        return head + "\n…\n[Preview truncated for performance – full prompt is still used when copying]"
+    }
+
+    /// Approximate total tokens from files + instructions, independent of preview length.
     var estimatedTokenCount: Int {
-        guard !promptPreview.isEmpty else { return 0 }
-        // Very rough heuristic: ~4 characters per token on average
-        return max(1, promptPreview.count / 4)
+        let fileTokens = estimatedFileTokenTotal
+        let instructionTokens = max(0, instructions.trimmingCharacters(in: .whitespacesAndNewlines).count / 4)
+        return max(1, fileTokens + instructionTokens)
     }
 }
 
