@@ -8,6 +8,7 @@
 import SwiftUI
 import AppKit
 import Combine
+import Foundation
 
 // MARK: - Helpers
 
@@ -21,6 +22,20 @@ fileprivate func formatTokenCount(_ tokens: Int) -> String {
     } else {
         return "\(tokens)"
     }
+}
+
+fileprivate func logTime(_ label: String, start: CFAbsoluteTime) {
+    let elapsedMs = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+    let formatted = String(format: "%.2f", elapsedMs)
+    print("[PromptPal][Timing] \(label): \(formatted) ms")
+}
+
+fileprivate func copyToPasteboardTimed(_ string: String, label: String) {
+    let t0 = CFAbsoluteTimeGetCurrent()
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    pasteboard.setString(string, forType: .string)
+    logTime("pasteboard copy (\(label))", start: t0)
 }
 
 // MARK: - Root View
@@ -192,7 +207,8 @@ struct MainPanelView: View {
                 Button("Copy Prompt") {
                     model.copyPromptToPasteboard()
                 }
-                // One click: this will build & copy, even if preview is empty
+                // Always rebuilds prompt and copies from latest file contents
+                .keyboardShortcut("c", modifiers: [.command, .option])
                 .disabled(!hasAnythingToSend || model.isBuildingPrompt)
 
                 Spacer()
@@ -280,7 +296,7 @@ struct PromptPreviewView: View {
             // Scrollable prompt preview
             Group {
                 if model.promptPreview.isEmpty {
-                    Text("Click “Copy Prompt” or “Generate Preview” to build the prompt.")
+                    Text("Click “Generate Preview” to visualize the full prompt. “Copy Prompt” works even without a preview.")
                         .foregroundStyle(.secondary)
                         .padding(.top, 8)
                     Spacer()
@@ -364,7 +380,11 @@ struct PromptPreviewView: View {
 final class PromptPalModel: ObservableObject {
     @Published var rootURL: URL?
     @Published var nodes: [FileNode] = []
-    @Published var instructions: String = ""
+    @Published var instructions: String = "" {
+        didSet {
+            promptDirty = true
+        }
+    }
     @Published var promptPreview: String = ""
 
     // Used for disabling buttons / showing spinners
@@ -373,13 +393,26 @@ final class PromptPalModel: ObservableObject {
     // Dummy to force SwiftUI to refresh when selection changes
     @Published private var selectionVersion: Int = 0
 
+    // Cached token stats (precomputed off the main thread)
+    @Published private(set) var fileTokenStats: [FileTokenStat] = []
+    @Published private(set) var estimatedFileTokenTotal: Int = 0
+
+    // Internal flags
+    private var promptDirty: Bool = false
+    private var tokenStatsGeneration: Int = 0
+
     // MARK: File tree loading
 
     func loadFolder(at url: URL) {
         rootURL = url
+        let t0 = CFAbsoluteTimeGetCurrent()
         nodes = buildNodes(for: url)
+        logTime("buildNodes (full tree)", start: t0)
+
         promptPreview = ""
         selectionVersion = 0
+        promptDirty = true
+        recalculateTokenStatsAsync()
     }
 
     private func buildNodes(for directory: URL) -> [FileNode] {
@@ -425,11 +458,15 @@ final class PromptPalModel: ObservableObject {
     func setAllSelected(_ value: Bool) {
         nodes.forEach { $0.setSelectedRecursively(value) }
         selectionVersion &+= 1
+        promptDirty = true
+        recalculateTokenStatsAsync()
     }
 
     func setSelection(for node: FileNode, isSelected: Bool) {
         node.setSelectedRecursively(isSelected)
         selectionVersion &+= 1
+        promptDirty = true
+        recalculateTokenStatsAsync()
     }
 
     private var selectedFiles: [FileNode] {
@@ -440,19 +477,101 @@ final class PromptPalModel: ObservableObject {
         selectedFiles.count
     }
 
+    // MARK: Token utilities (precomputed)
+
+    struct FileTokenStat: Identifiable {
+        let id = UUID()
+        let node: FileNode
+        let tokenEstimate: Int
+    }
+
+    private func recalculateTokenStatsAsync() {
+        let selectedFilesSnapshot = selectedFiles
+
+        // If nothing is selected, clear quickly.
+        if selectedFilesSnapshot.isEmpty {
+            fileTokenStats = []
+            estimatedFileTokenTotal = 0
+            return
+        }
+
+        tokenStatsGeneration &+= 1
+        let generation = tokenStatsGeneration
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let strongSelf = self else { return }
+
+            let stats: [FileTokenStat] = selectedFilesSnapshot.map { node in
+                let content = node.loadContent()
+                let tokens = max(1, content.count / 4)
+                return FileTokenStat(node: node, tokenEstimate: tokens)
+            }
+
+            let total = stats.reduce(0) { $0 + $1.tokenEstimate }
+
+            DispatchQueue.main.async {
+                if strongSelf.tokenStatsGeneration == generation {
+                    strongSelf.fileTokenStats = stats
+                    strongSelf.estimatedFileTokenTotal = total
+                    logTime("recalculateTokenStatsAsync (\(stats.count) files)", start: t0)
+                }
+            }
+        }
+    }
+
+    func relativePath(for node: FileNode) -> String {
+        guard let rootURL = rootURL else {
+            return node.url.lastPathComponent
+        }
+
+        let rootPath = rootURL.path
+        let fullPath = node.url.path
+
+        if fullPath.hasPrefix(rootPath) {
+            let index = fullPath.index(fullPath.startIndex, offsetBy: rootPath.count)
+            var relative = String(fullPath[index...])
+            if relative.hasPrefix("/") {
+                relative.removeFirst()
+            }
+            if relative.isEmpty {
+                return node.name
+            } else {
+                return relative
+            }
+        } else {
+            return node.url.lastPathComponent
+        }
+    }
+
     // MARK: Prompt building
 
     func rebuildPreview() {
-        buildPrompt(applyToPasteboard: false)
+        // Build and UPDATE preview, do NOT touch pasteboard
+        buildPrompt(applyToPasteboard: false, updatePreview: true, label: "GeneratePreview")
     }
 
     /// One-click: builds the prompt from the latest files and copies it.
+    /// This always rebuilds from disk to ensure freshest contents.
     func copyPromptToPasteboard() {
-        buildPrompt(applyToPasteboard: true)
+        let hasAnythingToSend =
+            !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            !selectedFiles.isEmpty
+
+        guard hasAnythingToSend else {
+            return
+        }
+
+        // Always build a fresh prompt for Copy Prompt.
+        buildPrompt(applyToPasteboard: true, updatePreview: false, label: "CopyPrompt build-only")
     }
 
     /// Shared builder used by both Generate Preview and Copy Prompt.
-    private func buildPrompt(applyToPasteboard: Bool) {
+    private func buildPrompt(
+        applyToPasteboard: Bool,
+        updatePreview: Bool,
+        label: String
+    ) {
         // Snapshot state on the main thread
         let instructionsSnapshot = instructions
         let trimmedInstructions = instructionsSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -462,44 +581,49 @@ final class PromptPalModel: ObservableObject {
 
         // Nothing to send
         guard !trimmedInstructions.isEmpty || !selectedFilesSnapshot.isEmpty else {
-            if !applyToPasteboard {
+            if !applyToPasteboard && updatePreview {
                 promptPreview = ""
             }
             return
         }
 
         isBuildingPrompt = true
+        let tBuild = CFAbsoluteTimeGetCurrent()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self else { return }
+            guard let strongSelf = self else { return }
 
-            let prompt = self.buildPrompt(
+            let prompt = strongSelf.buildPromptBody(
                 instructions: instructionsSnapshot,
                 rootURL: rootURLSnapshot,
                 nodesSnapshot: nodesSnapshot,
                 selectedFilesSnapshot: selectedFilesSnapshot
             )
 
-            DispatchQueue.main.async {
-                self.promptPreview = prompt
+            logTime("buildPrompt (background construction, \(label))", start: tBuild)
 
-                if applyToPasteboard {
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                    pasteboard.setString(prompt, forType: .string)
+            DispatchQueue.main.async {
+                if updatePreview {
+                    strongSelf.promptPreview = prompt
+                    strongSelf.promptDirty = false
                 }
 
-                self.isBuildingPrompt = false
+                if applyToPasteboard {
+                    copyToPasteboardTimed(prompt, label: label)
+                }
+
+                strongSelf.isBuildingPrompt = false
             }
         }
     }
 
-    private func buildPrompt(
+    private func buildPromptBody(
         instructions: String,
         rootURL: URL?,
         nodesSnapshot: [FileNode],
         selectedFilesSnapshot: [FileNode]
     ) -> String {
+        let tBody = CFAbsoluteTimeGetCurrent()
         var sections: [String] = []
 
         let trimmedInstructions = instructions.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -513,14 +637,19 @@ final class PromptPalModel: ObservableObject {
             sections.append(trimmedInstructions)
         }
 
-        if let rootURL {
+        if let rootURL = rootURL {
+            let tMap = CFAbsoluteTimeGetCurrent()
             sections.append(buildFileMapSection(rootURL: rootURL, nodes: nodesSnapshot))
+            logTime("buildFileMapSection (full tree)", start: tMap)
         }
 
         if hasFiles {
+            let tContents = CFAbsoluteTimeGetCurrent()
             sections.append(buildFileContentsSection(files: selectedFilesSnapshot))
+            logTime("buildFileContentsSection (selected files)", start: tContents)
         }
 
+        logTime("buildPrompt body total", start: tBody)
         return sections.joined(separator: "\n\n")
     }
 
@@ -608,60 +737,19 @@ final class PromptPalModel: ObservableObject {
 
             let fenceStart = language.isEmpty ? "```" : "```\(language)"
 
+            let tFile = CFAbsoluteTimeGetCurrent()
+            let content = node.loadContent()
+            logTime("loadContent \(path)", start: tFile)
+
             return """
             File: \(path)
             \(fenceStart)
-            \(node.loadContent())
+            \(content)
             ```
             """
         }
 
         return "<file_contents>\n" + parts.joined(separator: "\n\n") + "\n</file_contents>"
-    }
-
-    // MARK: - Token utilities
-
-    struct FileTokenStat: Identifiable {
-        let id = UUID()
-        let node: FileNode
-        let tokenEstimate: Int
-    }
-
-    var fileTokenStats: [FileTokenStat] {
-        let files = selectedFiles
-        return files.map { node in
-            let content = node.loadContent()
-            let tokens = max(1, content.count / 4)
-            return FileTokenStat(node: node, tokenEstimate: tokens)
-        }
-    }
-
-    var estimatedFileTokenTotal: Int {
-        fileTokenStats.reduce(0) { $0 + $1.tokenEstimate }
-    }
-
-    func relativePath(for node: FileNode) -> String {
-        guard let rootURL = rootURL else {
-            return node.url.lastPathComponent
-        }
-
-        let rootPath = rootURL.path
-        let fullPath = node.url.path
-
-        if fullPath.hasPrefix(rootPath) {
-            let index = fullPath.index(fullPath.startIndex, offsetBy: rootPath.count)
-            var relative = String(fullPath[index...])
-            if relative.hasPrefix("/") {
-                relative.removeFirst()
-            }
-            if relative.isEmpty {
-                return node.name
-            } else {
-                return relative
-            }
-        } else {
-            return node.url.lastPathComponent
-        }
     }
 
     // MARK: - Overall token estimate (full prompt)
@@ -685,9 +773,6 @@ final class FileNode: ObservableObject, Identifiable {
     @Published var children: [FileNode]?
     @Published var isSelected: Bool
 
-    private var cachedContent: String?
-    private var cachedModificationDate: Date?
-
     init(url: URL, isDirectory: Bool, children: [FileNode]? = nil, isSelected: Bool = false) {
         self.url = url
         self.name = url.lastPathComponent
@@ -698,7 +783,7 @@ final class FileNode: ObservableObject, Identifiable {
 
     func setSelectedRecursively(_ value: Bool) {
         isSelected = value
-        if isDirectory, let children {
+        if isDirectory, let children = children {
             children.forEach { $0.setSelectedRecursively(value) }
         }
     }
@@ -713,24 +798,10 @@ final class FileNode: ObservableObject, Identifiable {
         }
     }
 
-    /// Loads file content, re-reading from disk only when the file actually changed.
+    /// Always loads file content from disk so the prompt is built from the
+    /// latest version of each file (no in-memory caching).
     func loadContent() -> String {
         let path = url.path
-        let fm = FileManager.default
-
-        var currentModDate: Date? = nil
-        if let attrs = try? fm.attributesOfItem(atPath: path),
-           let mod = attrs[.modificationDate] as? Date {
-            currentModDate = mod
-        }
-
-        if let cachedContent,
-           let cachedModificationDate,
-           let currentModDate,
-           cachedModificationDate == currentModDate {
-            return cachedContent
-        }
-
         let text: String
         if let str = try? String(contentsOfFile: path, encoding: .utf8) {
             text = str
@@ -739,9 +810,6 @@ final class FileNode: ObservableObject, Identifiable {
         } else {
             text = "[Binary file]"
         }
-
-        cachedContent = text
-        cachedModificationDate = currentModDate
         return text
     }
 

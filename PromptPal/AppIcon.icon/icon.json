@@ -1,0 +1,82 @@
+{
+  "fill" : {
+    "linear-gradient" : [
+      "srgb:1.00000,1.00000,1.00000,1.00000",
+      "srgb:0.92143,0.92145,0.92144,1.00000"
+    ]
+  },
+  "groups" : [
+    {
+      "blur-material" : 0.5,
+      "layers" : [
+        {
+          "image-name" : "4.4 – layer.svg",
+          "name" : "4.4 – layer"
+        }
+      ],
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.35
+      }
+    },
+    {
+      "blur-material" : 0.5,
+      "layers" : [
+        {
+          "blend-mode" : "lighten",
+          "fill" : {
+            "linear-gradient" : [
+              "srgb:0.83742,0.83744,0.83743,1.00000",
+              "srgb:0.57046,0.57047,0.57046,1.00000"
+            ]
+          },
+          "image-name" : "3.3 – layer.svg",
+          "name" : "3.3 – layer"
+        }
+      ],
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 1
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.75
+      }
+    },
+    {
+      "blur-material" : 0.5,
+      "layers" : [
+        {
+          "fill" : {
+            "linear-gradient" : [
+              "display-p3:0.45823,0.82437,1.00000,1.00000",
+              "display-p3:0.00000,0.14678,0.65570,1.00000"
+            ]
+          },
+          "glass" : true,
+          "image-name" : "2.2 – layer.svg",
+          "name" : "2.2 – layer"
+        }
+      ],
+      "name" : "Group",
+      "shadow" : {
+        "kind" : "layer-color",
+        "opacity" : 1
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "circles" : [
+      "watchOS"
+    ],
+    "squares" : "shared"
+  }
+}
