@@ -13,5 +13,6 @@ struct PromptPalApp: App {
         WindowGroup {
             ContentView()
         }
+        .windowResizability(.contentSize)
     }
 }
