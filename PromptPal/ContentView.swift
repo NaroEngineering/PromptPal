@@ -118,20 +118,20 @@ struct SidebarView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        OutlineGroup(model.nodes, children: \.children) { node in
-                            FileRowView(
-                                node: node,
-                                onToggle: { node, isOn in
-                                    model.setSelection(for: node, isSelected: isOn)
-                                }
-                            )
-                        }
-                        .padding(.leading, 4)
+                // ✅ Use a real List sidebar outline so indentation/disclosure feels like Finder.
+                List {
+                    OutlineGroup(model.nodes, children: \.children) { node in
+                        FileRowView(
+                            node: node,
+                            onToggle: { node, isOn in
+                                model.setSelection(for: node, isSelected: isOn)
+                            }
+                        )
+                        .listRowInsets(EdgeInsets(top: 2, leading: 6, bottom: 2, trailing: 6))
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .listStyle(.sidebar)
+                .scrollContentBackground(.hidden)
                 .background(
                     RoundedRectangle(cornerRadius: 8)
                         .fill(Color.gray.opacity(0.06))
@@ -259,6 +259,8 @@ and the token summary updates with your file edits.
 struct PromptPreviewView: View {
     @ObservedObject var model: PromptPalModel
     @State private var showTokenDetails = false
+    @State private var tokenSortMode: TokenSortMode = .tokensDesc
+    @State private var tokenSearchText: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -292,7 +294,7 @@ struct PromptPreviewView: View {
             }
 
             // Token summary / per-file tokens
-            if model.selectedFilesCount > 0 {
+            if !model.fileTokenStats.isEmpty {
                 tokenSummaryCard
             }
 
@@ -305,7 +307,7 @@ struct PromptPreviewView: View {
 No preview yet.
 
 Click “Generate Preview” or “Copy Prompt” to build a (truncated) view of the current prompt. \
-The full, untruncated prompt is always used when copying.
+The full, untruncated prompt is always used when copying]
 """)
                     .foregroundStyle(.secondary)
                     .padding(.top, 8)
@@ -331,6 +333,46 @@ The full, untruncated prompt is always used when copying.
     private var tokenSummaryCard: some View {
         let fileTokenTotal = model.estimatedFileTokenTotal
 
+        let sortedStats: [PromptPalModel.FileTokenStat] = {
+            let stats = model.fileTokenStats
+            switch tokenSortMode {
+            case .path:
+                return stats.sorted {
+                    let lhsPath = model.relativePath(for: $0.node)
+                    let rhsPath = model.relativePath(for: $1.node)
+                    return lhsPath.localizedCaseInsensitiveCompare(rhsPath) == .orderedAscending
+                }
+            case .tokensAsc:
+                return stats.sorted { lhs, rhs in
+                    if lhs.tokenEstimate == rhs.tokenEstimate {
+                        let lhsPath = model.relativePath(for: lhs.node)
+                        let rhsPath = model.relativePath(for: rhs.node)
+                        return lhsPath.localizedCaseInsensitiveCompare(rhsPath) == .orderedAscending
+                    }
+                    return lhs.tokenEstimate < rhs.tokenEstimate
+                }
+            case .tokensDesc:
+                return stats.sorted { lhs, rhs in
+                    if lhs.tokenEstimate == rhs.tokenEstimate {
+                        let lhsPath = model.relativePath(for: lhs.node)
+                        let rhsPath = model.relativePath(for: rhs.node)
+                        return lhsPath.localizedCaseInsensitiveCompare(rhsPath) == .orderedAscending
+                    }
+                    return lhs.tokenEstimate > rhs.tokenEstimate
+                }
+            }
+        }()
+
+        let trimmedQuery = tokenSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filteredStats: [PromptPalModel.FileTokenStat] = {
+            guard !trimmedQuery.isEmpty else { return sortedStats }
+            return sortedStats.filter { stat in
+                let path = model.relativePath(for: stat.node)
+                return path.localizedCaseInsensitiveContains(trimmedQuery)
+                    || stat.node.name.localizedCaseInsensitiveContains(trimmedQuery)
+            }
+        }()
+
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Token summary")
@@ -342,9 +384,20 @@ The full, untruncated prompt is always used when copying.
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                Picker("Sort", selection: $tokenSortMode) {
+                    ForEach(TokenSortMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.menu)
+                .font(.caption)
+
                 Button {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         showTokenDetails.toggle()
+                        if !showTokenDetails {
+                            tokenSearchText = ""
+                        }
                     }
                 } label: {
                     Image(systemName: "chevron.down")
@@ -356,25 +409,72 @@ The full, untruncated prompt is always used when copying.
             }
 
             if showTokenDetails {
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+
+                    TextField("Search files…", text: $tokenSearchText)
+                        .textFieldStyle(.roundedBorder)
+
+                    if !tokenSearchText.isEmpty {
+                        Button {
+                            tokenSearchText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear search")
+                    }
+                }
+
+                if !trimmedQuery.isEmpty {
+                    Text("Showing \(filteredStats.count) of \(sortedStats.count)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 4) {
-                        ForEach(model.fileTokenStats) { stat in
+                        ForEach(filteredStats) { stat in
                             HStack {
-                                Text(model.relativePath(for: stat.node))
-                                    .font(.caption)
-                                    .lineLimit(1)
+                                Toggle(
+                                    "",
+                                    isOn: Binding(
+                                        get: { stat.node.isSelected },
+                                        set: { isOn in
+                                            model.setSelection(for: stat.node, isSelected: isOn)
+                                        }
+                                    )
+                                )
+                                .toggleStyle(.checkbox)
+                                .labelsHidden()
 
-                                Spacer()
+                                HStack {
+                                    Text(model.relativePath(for: stat.node))
+                                        .font(.caption)
+                                        .lineLimit(1)
 
-                                Text("\(formatTokenCount(stat.tokenEstimate))")
-                                    .font(.caption.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                                    Spacer()
+
+                                    Text("\(formatTokenCount(stat.tokenEstimate))")
+                                        .font(.caption.monospacedDigit())
+                                        .foregroundStyle(.secondary)
+                                }
+                                .allowsHitTesting(false)
                             }
+                        }
+
+                        if filteredStats.isEmpty {
+                            Text("No matches.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .padding(.top, 6)
                         }
                     }
                     .padding(.top, 2)
                 }
-                .frame(maxHeight: 140)
+                .frame(maxHeight: 180)
             }
         }
         .padding(10)
@@ -382,6 +482,27 @@ The full, untruncated prompt is always used when copying.
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.gray.opacity(0.06))
         )
+    }
+
+    // MARK: - Sorting mode
+
+    private enum TokenSortMode: String, CaseIterable, Identifiable {
+        case path
+        case tokensAsc
+        case tokensDesc
+
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .path:
+                return "Path"
+            case .tokensAsc:
+                return "Tokens ↑"
+            case .tokensDesc:
+                return "Tokens ↓"
+            }
+        }
     }
 }
 
@@ -475,6 +596,10 @@ final class PromptPalModel: ObservableObject {
         nodes.flatMap { $0.collectSelectedFiles() }
     }
 
+    private var allFiles: [FileNode] {
+        nodes.flatMap { $0.collectAllFiles() }
+    }
+
     var selectedFilesCount: Int {
         selectedFiles.count
     }
@@ -487,18 +612,16 @@ final class PromptPalModel: ObservableObject {
         let tokenEstimate: Int
     }
 
-    /// Recompute token stats from the current selected files.
+    /// Recompute token stats from the current full file set.
     private func recalculateTokenStatsAsync() {
-        let snapshot = selectedFiles
-        recalculateTokenStatsAsync(selectedFilesSnapshot: snapshot)
+        let snapshot = allFiles
+        recalculateTokenStatsAsync(filesSnapshot: snapshot)
     }
 
-    /// Recompute token stats from a specific snapshot of selected files.
-    /// This is used when we build a prompt so that token stats are based
-    /// on the *same* files/contents that were used to build the prompt.
-    private func recalculateTokenStatsAsync(selectedFilesSnapshot: [FileNode]) {
-        // If nothing is selected, clear quickly.
-        if selectedFilesSnapshot.isEmpty {
+    /// Recompute token stats from a specific snapshot of files.
+    private func recalculateTokenStatsAsync(filesSnapshot: [FileNode]) {
+        // If no files at all, clear quickly.
+        if filesSnapshot.isEmpty {
             fileTokenStats = []
             estimatedFileTokenTotal = 0
             return
@@ -511,18 +634,21 @@ final class PromptPalModel: ObservableObject {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let strongSelf = self else { return }
 
-            let stats: [FileTokenStat] = selectedFilesSnapshot.map { node in
+            let stats: [FileTokenStat] = filesSnapshot.map { node in
                 let content = node.loadContent()
                 let tokens = max(1, content.count / 4)
                 return FileTokenStat(node: node, tokenEstimate: tokens)
             }
 
-            let total = stats.reduce(0) { $0 + $1.tokenEstimate }
+            // Only selected files count toward the total used for the prompt.
+            let selectedTotal = stats.reduce(0) { partial, stat in
+                stat.node.isSelected ? partial + stat.tokenEstimate : partial
+            }
 
             DispatchQueue.main.async {
                 if strongSelf.tokenStatsGeneration == generation {
                     strongSelf.fileTokenStats = stats
-                    strongSelf.estimatedFileTokenTotal = total
+                    strongSelf.estimatedFileTokenTotal = selectedTotal
                     logTime("recalculateTokenStatsAsync (\(stats.count) files)", start: t0)
                 }
             }
@@ -556,8 +682,6 @@ final class PromptPalModel: ObservableObject {
     // MARK: Prompt building
 
     func rebuildPreview() {
-        // Build and UPDATE preview, do NOT touch pasteboard,
-        // and recompute token stats from the same snapshot.
         buildPrompt(
             applyToPasteboard: false,
             updatePreview: true,
@@ -566,9 +690,6 @@ final class PromptPalModel: ObservableObject {
         )
     }
 
-    /// One-click: builds the prompt from the latest files and copies it.
-    /// This always rebuilds from disk, updates the (truncated) preview,
-    /// and recomputes token stats from the same file snapshot.
     func copyPromptToPasteboard() {
         let hasAnythingToSend =
             !instructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
@@ -586,21 +707,18 @@ final class PromptPalModel: ObservableObject {
         )
     }
 
-    /// Shared builder used by both Generate Preview and Copy Prompt.
     private func buildPrompt(
         applyToPasteboard: Bool,
         updatePreview: Bool,
         label: String,
         recalcTokens: Bool
     ) {
-        // Snapshot state on the main thread
         let instructionsSnapshot = instructions
         let trimmedInstructions = instructionsSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
         let rootURLSnapshot = rootURL
         let nodesSnapshot = nodes
         let selectedFilesSnapshot = selectedFiles
 
-        // Nothing to send
         guard !trimmedInstructions.isEmpty || !selectedFilesSnapshot.isEmpty else {
             if !applyToPasteboard && updatePreview {
                 promptPreview = ""
@@ -633,7 +751,7 @@ final class PromptPalModel: ObservableObject {
                 }
 
                 if recalcTokens {
-                    strongSelf.recalculateTokenStatsAsync(selectedFilesSnapshot: selectedFilesSnapshot)
+                    strongSelf.recalculateTokenStatsAsync()
                 }
 
                 strongSelf.isBuildingPrompt = false
@@ -677,8 +795,6 @@ final class PromptPalModel: ObservableObject {
         return sections.joined(separator: "\n\n")
     }
 
-    // MARK: - <file_map> section
-
     private func buildFileMapSection(rootURL: URL, nodes: [FileNode]) -> String {
         var lines: [String] = []
         lines.append(rootURL.path)
@@ -694,7 +810,6 @@ final class PromptPalModel: ObservableObject {
 
     private func appendTree(_ nodes: [FileNode], prefix: String, into lines: inout [String]) {
         for node in nodes {
-            // Skip directories that have no file descendants at all
             if node.isDirectory && !node.hasAnyFileDescendant() {
                 continue
             }
@@ -728,7 +843,6 @@ final class PromptPalModel: ObservableObject {
     private func codeMapAvailable(for node: FileNode) -> Bool {
         guard !node.isDirectory else { return false }
         let ext = node.url.pathExtension.lowercased()
-        // Match their behavior: only Swift source files get "+"
         switch ext {
         case "swift":
             return true
@@ -736,8 +850,6 @@ final class PromptPalModel: ObservableObject {
             return false
         }
     }
-
-    // MARK: - <file_contents> section
 
     private func buildFileContentsSection(files: [FileNode]) -> String {
         guard !files.isEmpty else {
@@ -777,11 +889,8 @@ final class PromptPalModel: ObservableObject {
         return "<file_contents>\n" + parts.joined(separator: "\n\n") + "\n</file_contents>"
     }
 
-    // MARK: - Preview + token helpers
-
-    /// Truncate the preview string to keep SwiftUI rendering fast.
     private func makeTruncatedPreview(from full: String) -> String {
-        let maxChars = 4000  // tweak as needed
+        let maxChars = 4000
         guard full.count > maxChars else {
             return full
         }
@@ -791,7 +900,6 @@ final class PromptPalModel: ObservableObject {
         return head + "\n…\n[Preview truncated for performance – full prompt is still used when copying]"
     }
 
-    /// Approximate total tokens from files + instructions, independent of preview length.
     var estimatedTokenCount: Int {
         let fileTokens = estimatedFileTokenTotal
         let instructionTokens = max(0, instructions.trimmingCharacters(in: .whitespacesAndNewlines).count / 4)
@@ -807,7 +915,6 @@ final class FileNode: ObservableObject, Identifiable {
     let name: String
     let isDirectory: Bool
 
-    // Optional children so OutlineGroup can use KeyPath<FileNode, [FileNode]?>
     @Published var children: [FileNode]?
     @Published var isSelected: Bool
 
@@ -836,8 +943,14 @@ final class FileNode: ObservableObject, Identifiable {
         }
     }
 
-    /// Always loads file content from disk so the prompt is built from the
-    /// latest version of each file (no in-memory caching).
+    func collectAllFiles() -> [FileNode] {
+        if isDirectory {
+            return (children ?? []).flatMap { $0.collectAllFiles() }
+        } else {
+            return [self]
+        }
+    }
+
     func loadContent() -> String {
         let path = url.path
         let text: String
@@ -851,7 +964,6 @@ final class FileNode: ObservableObject, Identifiable {
         return text
     }
 
-    /// Returns true if this node has any (non-directory) file in its subtree.
     func hasAnyFileDescendant() -> Bool {
         if !isDirectory {
             return true
